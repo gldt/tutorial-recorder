@@ -6,6 +6,8 @@
  * pointer, so an injected overlay draws one, plus a caption bar and a
  * highlight ring around whatever is about to be clicked. Each recording is
  * saved as .webm and, when ffmpeg is installed, copied to an H.264 .mp4.
+ * Given a `voice`, the .mp4 is also narrated: each caption is read aloud by a
+ * text-to-speech engine, and the caption holds until the voice finishes.
  *
  *   const recorder = createRecorder({ baseUrl, outputDir, login });
  *   const { page, finish } = await recorder.startRecording('my-tutorial');
@@ -13,12 +15,17 @@
  *   await click(page, page.getByRole('link', { name: 'Settings' }));
  *   await finish();
  *
- * HEADED=1 in the environment shows the browser while it records.
+ * HEADED=1 in the environment shows the browser while it records. VOICE=0
+ * records silently; VOICE=macos or VOICE=elevenlabs switches the engine.
  */
 import { chromium } from 'playwright';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+
+/** Narration state for each recording page: its voice, when recording began, and the clips said so far. */
+const narrations = new WeakMap();
 
 /**
  * Runs in every page before its scripts: installs the pointer, caption bar and
@@ -113,6 +120,10 @@ function installOverlay(hideSelectors) {
  * @param {{ width: number, height: number }} [options.viewport]  default 1280x800
  * @param {string[]} [options.hideSelectors]  elements to hide in every video
  * @param {boolean} [options.ignoreHTTPSErrors]  default true, for local dev certificates
+ * @param {'macos'|'elevenlabs'|{ engine: 'macos', name?: string }|{ engine: 'elevenlabs', voiceId?: string, model?: string }} [options.voice]
+ *        narrates every caption; leave out for silent videos
+ * @param {string} [options.cacheDir]  where narration clips are kept between runs,
+ *        default `<outputDir>/.voice-cache`
  */
 export function createRecorder({
     outputDir,
@@ -120,7 +131,11 @@ export function createRecorder({
     viewport = { width: 1280, height: 800 },
     hideSelectors = [],
     ignoreHTTPSErrors = true,
+    voice,
+    cacheDir = join(outputDir, '.voice-cache'),
 }) {
+    const narrator = createNarrator(voice, cacheDir);
+
     return {
         /**
          * Open a page that records to `<outputDir>/<name>.webm`, signed in
@@ -151,6 +166,7 @@ export function createRecorder({
             });
             await context.addInitScript(installOverlay, hideSelectors);
             const page = await context.newPage();
+            narrations.set(page, { narrator, startedAt: performance.now(), clips: [] });
 
             return {
                 page,
@@ -162,7 +178,7 @@ export function createRecorder({
                     await browser.close();
                     rmSync(rawDir, { recursive: true, force: true });
 
-                    return toMp4(target);
+                    return toMp4(target, narrations.get(page).clips);
                 },
             };
         },
@@ -173,16 +189,34 @@ export function createRecorder({
  * Copy a .webm to an H.264 .mp4 beside it, since QuickTime and most sharing
  * tools won't play .webm. Keeps the .webm either way and returns it when
  * ffmpeg isn't installed.
+ *
+ * `clips` are narration to mix in, each starting `atMs` into the video. If
+ * mixing fails, the .mp4 is made without sound instead.
+ *
+ * @param {string} webm
+ * @param {{ file: string, atMs: number }[]} [clips]
  */
-export function toMp4(webm) {
+export function toMp4(webm, clips = []) {
     const mp4 = webm.replace(/\.webm$/, '.mp4');
-    const result = spawnSync('ffmpeg', [
-        '-loglevel', 'error', '-y', '-i', webm,
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '20', '-movflags', '+faststart',
-        mp4,
-    ], { stdio: 'inherit' });
+    const video = ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '20', '-movflags', '+faststart'];
 
-    if (result.error || result.status !== 0) {
+    if (clips.length) {
+        const delayed = clips.map((clip, i) => `[${i + 1}:a]adelay=delays=${Math.round(clip.atMs)}:all=1[a${i}]`);
+        const mix = `${clips.map((_, i) => `[a${i}]`).join('')}amix=inputs=${clips.length}:normalize=0[narration]`;
+
+        if (ffmpeg([
+            '-i', webm, ...clips.flatMap((clip) => ['-i', clip.file]),
+            '-filter_complex', [...delayed, mix].join(';'),
+            '-map', '0:v', '-map', '[narration]', ...video, '-c:a', 'aac', '-b:a', '160k',
+            mp4,
+        ])) {
+            return mp4;
+        }
+
+        console.warn(`Couldn't mix in the narration, so ${mp4} has no sound.`);
+    }
+
+    if (!ffmpeg(['-i', webm, ...video, mp4])) {
         console.warn(`Couldn't convert to .mp4 (is ffmpeg installed? brew install ffmpeg). Kept ${webm}`);
 
         return webm;
@@ -191,16 +225,52 @@ export function toMp4(webm) {
     return mp4;
 }
 
+/** Run ffmpeg quietly, overwriting its output; true when it succeeded. */
+function ffmpeg(args) {
+    const result = spawnSync('ffmpeg', ['-loglevel', 'error', '-y', ...args], { stdio: 'inherit' });
+
+    return !result.error && result.status === 0;
+}
+
 /** Wait long enough to read a caption: ~4 words a second, at least 1.8s. */
 function readingTime(text) {
     return Math.max(1800, text.split(/\s+/).length * 260);
 }
 
-/** Show a caption and hold on it while the viewer reads. */
-export async function say(page, text, holdMs = readingTime(text)) {
+/**
+ * Show a caption and hold on it while the viewer reads. When the recording is
+ * narrated, the caption is also read aloud, and holds until the voice is done.
+ *
+ * The third argument is either the hold in milliseconds, or options:
+ * `holdMs`, and `spoken` for text the voice should say instead of the caption,
+ * e.g. to spell out a case number.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} text
+ * @param {number|{ holdMs?: number, spoken?: string }} [options]
+ */
+export async function say(page, text, options = {}) {
+    const { holdMs = readingTime(text), spoken = text } = typeof options === 'number' ? { holdMs: options } : options;
+
     await page.waitForFunction(() => window.__tutorial);
     await page.evaluate((t) => window.__tutorial.caption(t), text);
-    await page.waitForTimeout(holdMs);
+    const shownAt = performance.now();
+    let holdUntil = shownAt + holdMs;
+
+    const narration = narrations.get(page);
+    if (narration?.narrator) {
+        try {
+            const clip = await narration.narrator.clip(spoken);
+            narration.clips.push({ file: clip.file, atMs: shownAt - narration.startedAt });
+            holdUntil = Math.max(holdUntil, shownAt + clip.durationMs + 500);
+        } catch (error) {
+            console.warn(`Couldn't narrate "${spoken}": ${error.message}\nThis video will have no sound.`);
+            narration.narrator = null;
+            narration.clips = [];
+        }
+    }
+
+    await page.waitForTimeout(Math.max(0, holdUntil - performance.now()));
 }
 
 /** Hide the caption bar and highlight ring. */
@@ -282,4 +352,125 @@ export async function clearMailpit(address) {
 
 function mailpitApi() {
     return process.env.MAILPIT_URL ?? 'http://127.0.0.1:8025';
+}
+
+/**
+ * Text-to-speech engines. Each writes one spoken line to an audio file;
+ * `settings` lists what makes its clips differ, for the cache key.
+ */
+const engines = {
+    /** The `say` command built into macOS. Free and offline, for drafts. */
+    macos: {
+        extension: 'aiff',
+        problem({ name }) {
+            if (process.platform !== 'darwin') {
+                return 'the macos voice only works on macOS';
+            }
+
+            // `say` quietly falls back to the default voice for a name it doesn't know.
+            const installed = spawnSync('say', ['-v', '?'], { encoding: 'utf8' }).stdout ?? '';
+
+            return !name || installed.split('\n').some((line) => line.startsWith(`${name} `)) ? null : `no macOS voice is named "${name}" (list them with say -v '?')`;
+        },
+        settings: ({ name = '' }) => [name],
+        async synthesize(text, { name }, file) {
+            const result = spawnSync('say', ['-o', file, ...(name ? ['-v', name] : [])], { input: text, encoding: 'utf8' });
+
+            if (result.error || result.status !== 0) {
+                throw new Error(result.error?.message ?? (result.stderr.trim() || `say exited with ${result.status}`));
+            }
+        },
+    },
+
+    /** ElevenLabs' hosted voices, for finished videos. Needs ELEVENLABS_API_KEY. */
+    elevenlabs: {
+        extension: 'mp3',
+        problem: () => (process.env.ELEVENLABS_API_KEY ? null : 'ELEVENLABS_API_KEY isn\'t set'),
+        settings: ({ voiceId = 'JBFqnCBsd6RMkjVDRZzb', model = 'eleven_multilingual_v2' }) => [voiceId, model],
+        async synthesize(text, settings, file) {
+            const [voiceId, model] = this.settings(settings);
+            const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`, {
+                method: 'POST',
+                headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text, model_id: model }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`ElevenLabs answered ${response.status}: ${(await response.text()).slice(0, 300)}`);
+            }
+
+            writeFileSync(file, Buffer.from(await response.arrayBuffer()));
+        },
+    },
+};
+
+/**
+ * The narrator for a recorder's `voice`, or null for silent videos. VOICE=0
+ * in the environment turns narration off, and VOICE=<engine> switches engine.
+ * Anything that would stop narration from working (no ffmpeg, no API key) is
+ * reported once here, and the videos are made without sound.
+ */
+function createNarrator(voice, cacheDir) {
+    const override = process.env.VOICE;
+
+    if (override === '0' || (!voice && !override)) {
+        return null;
+    }
+
+    const settings = { ...(typeof voice === 'string' ? { engine: voice } : voice), ...(override ? { engine: override } : {}) };
+    const engine = engines[settings.engine];
+
+    if (!engine) {
+        throw new Error(`Unknown voice engine "${settings.engine}"; use one of: ${Object.keys(engines).join(', ')}.`);
+    }
+
+    const problem = engine.problem(settings)
+        ?? (['ffmpeg', 'ffprobe'].every((tool) => !spawnSync(tool, ['-version']).error) ? null : 'narration needs ffmpeg (brew install ffmpeg)');
+
+    if (problem) {
+        console.warn(`Recording without narration: ${problem}.`);
+
+        return null;
+    }
+
+    const durations = new Map();
+
+    return {
+        /**
+         * The clip for a line of narration, made once and then reused from
+         * the cache on later runs.
+         *
+         * @returns {Promise<{ file: string, durationMs: number }>}
+         */
+        async clip(text) {
+            const key = createHash('sha256').update(JSON.stringify([settings.engine, ...engine.settings(settings), text])).digest('hex');
+            const file = join(cacheDir, `${key.slice(0, 32)}.${engine.extension}`);
+
+            if (!existsSync(file)) {
+                mkdirSync(cacheDir, { recursive: true });
+                // Written under another name first, so a failed run can't leave a broken clip in the cache.
+                const partial = join(cacheDir, `${key.slice(0, 32)}.partial.${engine.extension}`);
+                await engine.synthesize(text, settings, partial);
+                renameSync(partial, file);
+            }
+
+            if (!durations.has(file)) {
+                durations.set(file, audioDuration(file));
+            }
+
+            return { file, durationMs: durations.get(file) };
+        },
+    };
+}
+
+/** How long an audio file plays, in milliseconds. */
+function audioDuration(file) {
+    const result = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file], { encoding: 'utf8' });
+    const seconds = Number.parseFloat(result.stdout);
+
+    if (result.error || !Number.isFinite(seconds)) {
+        throw new Error(`couldn't read the length of ${file}`);
+    }
+
+    return Math.round(seconds * 1000);
 }
