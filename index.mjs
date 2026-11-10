@@ -389,17 +389,41 @@ const engines = {
         settings: ({ voiceId = 'JBFqnCBsd6RMkjVDRZzb', model = 'eleven_multilingual_v2' }) => [voiceId, model],
         async synthesize(text, settings, file) {
             const [voiceId, model] = this.settings(settings);
-            const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`, {
-                method: 'POST',
-                headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text, model_id: model }),
-            });
 
-            if (!response.ok) {
+            // A timeout, rate limit or server error is usually brief, so each gets one retry.
+            for (let attempt = 1; ; attempt++) {
+                const canRetry = attempt < 2;
+                let response;
+
+                try {
+                    response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`, {
+                        method: 'POST',
+                        headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text, model_id: model }),
+                        signal: AbortSignal.timeout(30000),
+                    });
+                } catch (error) {
+                    if (canRetry) {
+                        await new Promise((resolve) => setTimeout(resolve, 2000));
+                        continue;
+                    }
+
+                    throw new Error(error.name === 'TimeoutError' ? 'ElevenLabs didn\'t answer within 30s' : error.message);
+                }
+
+                if (response.ok) {
+                    writeFileSync(file, Buffer.from(await response.arrayBuffer()));
+
+                    return;
+                }
+
+                if (canRetry && (response.status === 429 || response.status >= 500)) {
+                    await new Promise((resolve) => setTimeout(resolve, 2000));
+                    continue;
+                }
+
                 throw new Error(`ElevenLabs answered ${response.status}: ${(await response.text()).slice(0, 300)}`);
             }
-
-            writeFileSync(file, Buffer.from(await response.arrayBuffer()));
         },
     },
 };
