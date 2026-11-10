@@ -11,7 +11,7 @@ npm install --save-dev github:gldt-dboyle/tutorial-recorder playwright
 npx playwright install chromium
 ```
 
-`ffmpeg` is optional. With it, every `.webm` recording is also copied to an `.mp4` that QuickTime and most sharing tools can play (`brew install ffmpeg`).
+`ffmpeg` is optional (narration needs it). With it, every `.webm` recording is also copied to an `.mp4` that QuickTime and most sharing tools can play (`brew install ffmpeg`).
 
 ## Use
 
@@ -48,11 +48,39 @@ Pass `{ signedIn: false }` to `startRecording` for tutorials that begin on the s
 
 | Helper | Does |
 |---|---|
-| `say(page, text, holdMs?)` | Shows a caption and holds while it's read (about 4 words a second) |
+| `say(page, text, holdMs?)` | Shows a caption and holds while it's read (about 4 words a second), or until the narration finishes if that's longer. The third argument can also be `{ holdMs, spoken }` |
 | `pointAt(page, locator)` | Glides the pointer to an element and rings it |
 | `click(page, locator)` | Points, then clicks |
 | `type(page, locator, text)` | Clicks into a field and types at a human pace |
 | `clearOverlay(page)` | Hides the caption and ring |
 | `mailpitLink(address, pattern)` | First matching link in the newest email [Mailpit](https://mailpit.axllent.org) caught for an address, e.g. a verification link |
 | `clearMailpit(address)` | Deletes Mailpit's emails for an address so an old one isn't picked up |
-| `toMp4(webmPath)` | The `.mp4` conversion `finish()` runs |
+| `toMp4(webmPath, clips?)` | The `.mp4` conversion `finish()` runs, mixing in any narration clips |
+
+## Narration
+
+Give the recorder a `voice` and every caption is also read aloud. The narration goes into the `.mp4`, so it needs `ffmpeg`. The `.webm` stays silent.
+
+```js
+const recorder = createRecorder({
+    outputDir: 'videos',
+    voice: { engine: 'elevenlabs', voiceId: 'JBFqnCBsd6RMkjVDRZzb' },
+});
+```
+
+| Engine | Settings | For |
+|---|---|---|
+| `macos` | `name`: a voice from `say -v '?'`, default the system voice | Drafts. Free, offline, macOS only |
+| `elevenlabs` | `voiceId` (default `JBFqnCBsd6RMkjVDRZzb`), `model` (default `eleven_multilingual_v2`) | Finished videos. Needs `ELEVENLABS_API_KEY` in the environment |
+
+`voice: 'macos'` or `voice: 'elevenlabs'` uses that engine's defaults. In the environment, `VOICE=0` records without narration, and `VOICE=macos` or `VOICE=elevenlabs` switches the engine for one run without editing code, e.g. `VOICE=macos` for a free draft.
+
+When a caption reads awkwardly out loud, give the voice its own text:
+
+```js
+await say(page, 'Open case T90001', { spoken: 'Open case T nine zero zero zero one' });
+```
+
+Clips are cached in `<outputDir>/.voice-cache` (or `cacheDir`) by engine, voice, model and text, so a re-run only pays for lines that changed. Delete the folder to regenerate everything.
+
+If narration can't work, the video is still made, just without sound, and a warning says why. That covers a missing API key, missing `ffmpeg`, an unknown macOS voice, or an error from the engine.

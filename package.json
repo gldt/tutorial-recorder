@@ -1,6 +1,6 @@
 {
     "name": "tutorial-recorder",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Record captioned how-to videos of a web app by scripting a browser with Playwright.",
     "private": true,
     "type": "module",
